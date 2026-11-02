@@ -219,6 +219,31 @@ pub(crate) fn normalize_message_contents(messages: &mut [JsonValue], non_text: N
     }
 }
 
+// Native DeepSeek prompts have one reasoning block before the tool-call group.
+pub(crate) fn reasoning_content_parts(reasoning: Option<&JsonValue>) -> impl Iterator<Item = &str> {
+    let parts: &[JsonValue] = match reasoning {
+        Some(JsonValue::Array(parts)) => parts,
+        Some(value) => std::slice::from_ref(value),
+        None => &[],
+    };
+    parts
+        .iter()
+        .filter_map(JsonValue::as_str)
+        .filter(|s| !s.is_empty())
+}
+
+pub(crate) fn append_reasoning_content(prompt: &mut String, reasoning: Option<&JsonValue>) -> bool {
+    let mut appended = false;
+    for text in reasoning_content_parts(reasoning) {
+        if appended {
+            prompt.push('\n');
+        }
+        prompt.push_str(text);
+        appended = true;
+    }
+    appended
+}
+
 pub(crate) fn encode_arguments_to_dsml(tool_call: &JsonValue) -> Result<String> {
     let arguments_str = tool_call
         .get("arguments")

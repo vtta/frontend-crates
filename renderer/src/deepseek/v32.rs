@@ -13,8 +13,9 @@ use serde_json::Value as JsonValue;
 use std::fmt::Write;
 
 use super::common::{
-    NormalizeNonText, RESPONSE_FORMAT_TEMPLATE, TOOLS_SYSTEM_TEMPLATE, encode_arguments_to_dsml,
-    find_last_user_index, normalize_message_contents, render_tools, to_json,
+    NormalizeNonText, RESPONSE_FORMAT_TEMPLATE, TOOLS_SYSTEM_TEMPLATE, append_reasoning_content,
+    encode_arguments_to_dsml, find_last_user_index, normalize_message_contents, render_tools,
+    to_json,
 };
 
 pub use super::common::{ThinkingMode, tokens};
@@ -105,27 +106,7 @@ fn render_message(
             if thinking_mode == ThinkingMode::Thinking
                 && last_user_idx.is_some_and(|idx| index > idx)
             {
-                let mut has_reasoning = false;
-                match msg.get("reasoning_content") {
-                    Some(JsonValue::String(text)) if !text.is_empty() => {
-                        prompt.push_str(text);
-                        has_reasoning = true;
-                    }
-                    Some(JsonValue::Array(parts)) => {
-                        for text in parts
-                            .iter()
-                            .filter_map(JsonValue::as_str)
-                            .filter(|s| !s.is_empty())
-                        {
-                            if has_reasoning {
-                                prompt.push('\n');
-                            }
-                            prompt.push_str(text);
-                            has_reasoning = true;
-                        }
-                    }
-                    _ => {}
-                }
+                let has_reasoning = append_reasoning_content(prompt, msg.get("reasoning_content"));
                 if has_reasoning {
                     prompt.push_str(tokens::THINKING_END);
                 }
