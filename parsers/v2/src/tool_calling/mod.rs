@@ -28,3 +28,5 @@ pub use v1core::{CalledFunctionStream, ToolCallResponseChunk, ToolCallType};
 pub use registry::{
     REGISTERED_FAMILIES, create_tool_parser_for_family, structural_tag_builder_for_family,
 };
+
+pub(crate) mod input;

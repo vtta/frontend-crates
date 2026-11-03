@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::tool_calling::input::InputText;
 use anyhow::Context;
 use serde_json::{Map, Value};
 
@@ -32,7 +33,7 @@ pub fn token_unified(_tools: &[Tool]) -> Box<dyn UnifiedParser> {
     build(true)
 }
 
-fn build(external_boundaries: bool) -> Box<dyn UnifiedParser> {
+fn build(token_input: bool) -> Box<dyn UnifiedParser> {
     let spec = WrappedBlockSpec {
         family: "deepseek_v41",
         block_starts: vec![BLOCK_START.into()],
@@ -51,10 +52,14 @@ fn build(external_boundaries: bool) -> Box<dyn UnifiedParser> {
         .with_reasoning(ReasoningSpec {
             start: "<think>",
             end: "</think>",
-            external_boundaries,
             preserve_special_tokens: true,
             ..Default::default()
         });
+    let scanner = if token_input {
+        scanner.with_token_input()
+    } else {
+        scanner
+    };
     Box::new(GuidedRouted::new(ScannerUnified::new(scanner)))
 }
 
@@ -81,10 +86,16 @@ fn count_boundary_bytes(bytes: usize) {
     let _ = bytes;
 }
 
-fn find_from(text: &str, start: usize, marker: &str) -> Option<usize> {
-    let suffix = &text[start..];
+fn find_from<'a>(text: impl Into<InputText<'a>>, start: usize, marker: &str) -> Option<usize> {
+    let text = text.into();
+    let suffix = text.suffix(start);
     count_boundary_bytes(suffix.len());
-    suffix.find(marker).map(|at| start + at)
+    let found = if marker.contains("｜DSML｜") {
+        suffix.find_marker(marker)
+    } else {
+        suffix.find(marker)
+    };
+    found.map(|at| start + at)
 }
 
 fn find_payload_from(text: &str, start: usize) -> Option<usize> {
@@ -132,7 +143,7 @@ struct DeepSeekV41InvocationBoundary {
 }
 
 impl DeepSeekV41InvocationBoundary {
-    fn malformed_end(text: &str, start: usize, flush: bool) -> Option<usize> {
+    fn malformed_end(text: InputText<'_>, start: usize, flush: bool) -> Option<usize> {
         flush
             .then(|| find_from(text, start, INVOKE_END))
             .flatten()
@@ -141,13 +152,6 @@ impl DeepSeekV41InvocationBoundary {
 }
 
 impl InvokeBoundary for DeepSeekV41InvocationBoundary {
-    fn owns_reasoning_boundary(&self) -> bool {
-        matches!(
-            self.position,
-            InvocationPosition::ParameterValue { .. } | InvocationPosition::JsonValue
-        )
-    }
-
     fn owns_guided_prefix(&self) -> bool {
         true
     }
@@ -201,11 +205,21 @@ impl InvokeBoundary for DeepSeekV41InvocationBoundary {
         flush: bool,
         _tool_index: usize,
     ) -> Option<usize> {
+        self.end_input(InputText::plain(candidate), _append, flush, _tool_index)
+    }
+
+    fn end_input(
+        &mut self,
+        candidate: InputText<'_>,
+        _append: &str,
+        flush: bool,
+        _tool_index: usize,
+    ) -> Option<usize> {
         loop {
             match self.position {
                 InvocationPosition::Header => {
                     let Some(end) = find_from(candidate, self.scan_from, "\">") else {
-                        self.scan_from = next_scan_start(candidate, 2);
+                        self.scan_from = next_scan_start(&candidate, 2);
                         return None;
                     };
                     self.scan_from = end + 2;
@@ -263,7 +277,7 @@ impl InvokeBoundary for DeepSeekV41InvocationBoundary {
                         }
                         (None, None) => {
                             self.scan_from = next_scan_start(
-                                candidate,
+                                &candidate,
                                 INVOKE_END.len().max(PARAMETER_START.len()),
                             );
                             return None;
@@ -277,7 +291,7 @@ impl InvokeBoundary for DeepSeekV41InvocationBoundary {
                         }
                         self.position = InvocationPosition::ParameterHeader {
                             start,
-                            scan_from: next_scan_start(candidate, 2),
+                            scan_from: next_scan_start(&candidate, 2),
                         };
                         return None;
                     };
@@ -299,7 +313,7 @@ impl InvokeBoundary for DeepSeekV41InvocationBoundary {
                         }
                         self.position = InvocationPosition::ParameterValue {
                             start,
-                            scan_from: next_scan_start(candidate, PARAMETER_END.len()),
+                            scan_from: next_scan_start(&candidate, PARAMETER_END.len()),
                         };
                         return None;
                     };
@@ -311,6 +325,13 @@ impl InvokeBoundary for DeepSeekV41InvocationBoundary {
                 }
             }
         }
+    }
+
+    fn owns_reasoning_boundary(&self) -> bool {
+        matches!(
+            self.position,
+            InvocationPosition::ParameterValue { .. } | InvocationPosition::JsonValue
+        )
     }
 
     fn opens(&self, _text: &str, _at: usize) -> bool {
@@ -336,10 +357,9 @@ pub(crate) fn invocation_boundary() -> Box<dyn InvokeBoundary> {
 
 pub(crate) struct DeepSeekV41;
 
-impl InvokeEmitter for DeepSeekV41 {
-    fn parse_invoke(
-        &mut self,
-        invoke: &str,
+impl DeepSeekV41 {
+    fn parse_invoke_input(
+        invoke: InputText<'_>,
         tool_index: usize,
     ) -> anyhow::Result<Option<ToolCallDelta>> {
         let (name, body) = invoke
@@ -358,12 +378,17 @@ impl InvokeEmitter for DeepSeekV41 {
         } else {
             Map::new()
         };
+        let body_end = invoke.len() - INVOKE_END.len();
         while !body.trim().is_empty() {
             let (name, string, value) = parameter_header(body.trim_start())
                 .context("invalid DeepSeek V4.1 parameter header")?;
-            let (raw, remainder) = value
-                .split_once(PARAMETER_END)
+            let value_start = body_end - value.len();
+            let end = invoke
+                .slice(value_start..body_end)
+                .find_marker(PARAMETER_END)
                 .context("incomplete DeepSeek V4.1 parameter")?;
+            let raw = &value[..end];
+            let remainder = &value[end + PARAMETER_END.len()..];
             let value = if string {
                 Value::String(raw.to_string())
             } else {
@@ -381,6 +406,24 @@ impl InvokeEmitter for DeepSeekV41 {
             arguments: serde_json::to_string(&arguments)?,
             complete: true,
         }))
+    }
+}
+
+impl InvokeEmitter for DeepSeekV41 {
+    fn parse_invoke(
+        &mut self,
+        invoke: &str,
+        tool_index: usize,
+    ) -> anyhow::Result<Option<ToolCallDelta>> {
+        Self::parse_invoke_input(InputText::plain(invoke), tool_index)
+    }
+
+    fn parse_input(
+        &mut self,
+        invoke: InputText<'_>,
+        tool_index: usize,
+    ) -> anyhow::Result<Option<Vec<ToolCallDelta>>> {
+        Ok(Self::parse_invoke_input(invoke, tool_index)?.map(|delta| vec![delta]))
     }
 
     fn defer_parse_error(&self, _invoke: &str, error: &anyhow::Error) -> bool {
@@ -918,7 +961,8 @@ mod tests {
 mod token_boundary_tests {
     use super::*;
     use crate::{
-        UnifiedEvent, UnifiedParserInit, UnifiedParserOutput, UnifiedParserStartingState, assemble,
+        DecodedInput, UnifiedEvent, UnifiedParserInit, UnifiedParserOutput,
+        UnifiedParserStartingState, assemble,
     };
 
     fn parser() -> Box<dyn UnifiedParser> {
@@ -930,6 +974,23 @@ mod token_boundary_tests {
             })
             .unwrap();
         parser
+    }
+
+    fn feed_dsml(parser: &mut dyn UnifiedParser, text: &str, out: &mut UnifiedParserOutput) {
+        for part in text.split_inclusive("｜DSML｜") {
+            if let Some(plain) = part.strip_suffix("｜DSML｜") {
+                parser
+                    .parse_decoded_into(DecodedInput::Text(plain), out)
+                    .unwrap();
+                parser
+                    .parse_decoded_into(DecodedInput::ControlToken("｜DSML｜"), out)
+                    .unwrap();
+            } else {
+                parser
+                    .parse_decoded_into(DecodedInput::Text(part), out)
+                    .unwrap();
+            }
+        }
     }
 
     #[test]
@@ -956,7 +1017,9 @@ mod token_boundary_tests {
                 for text in chunks(before) {
                     parser.parse_into(&text, &mut out).unwrap();
                 }
-                parser.reasoning_boundary(false, &mut out).unwrap();
+                parser
+                    .parse_decoded_into(DecodedInput::ControlToken("</think>"), &mut out)
+                    .unwrap();
                 for text in chunks(after) {
                     parser.parse_into(&text, &mut out).unwrap();
                 }
@@ -978,33 +1041,50 @@ mod token_boundary_tests {
     fn repeated_close_is_idempotent() {
         let mut parser = parser();
         let mut out = UnifiedParserOutput::default();
-        parser.reasoning_boundary(false, &mut out).unwrap();
+        parser
+            .parse_decoded_into(DecodedInput::ControlToken("</think>"), &mut out)
+            .unwrap();
         parser.parse_into("A", &mut out).unwrap();
-        parser.reasoning_boundary(false, &mut out).unwrap();
+        parser
+            .parse_decoded_into(DecodedInput::ControlToken("</think>"), &mut out)
+            .unwrap();
         parser.parse_into("B", &mut out).unwrap();
         out.events.extend(parser.finish().unwrap().events);
         assert_eq!(
             assemble(&out.events),
             vec![UnifiedEvent::Text { text: "AB".into() }]
         );
-        assert!(parser.reasoning_boundary(false, &mut out).is_err());
+        assert!(
+            parser
+                .parse_decoded_into(DecodedInput::ControlToken("</think>"), &mut out)
+                .is_err()
+        );
     }
 
     #[test]
     fn tool_argument_payload_owns_marker_spellings() {
         let mut parser = parser();
         let mut out = UnifiedParserOutput::default();
-        parser.reasoning_boundary(false, &mut out).unwrap();
-        parser.parse_into("<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"bash\">\n<｜DSML｜ parameter name=\"command\" string=\"true\">echo ", &mut out).unwrap();
-        parser.reasoning_boundary(true, &mut out).unwrap();
-        parser.parse_into("literal", &mut out).unwrap();
-        parser.reasoning_boundary(false, &mut out).unwrap();
         parser
-            .parse_into(
-                "</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
-                &mut out,
-            )
+            .parse_decoded_into(DecodedInput::ControlToken("</think>"), &mut out)
             .unwrap();
+        feed_dsml(
+            parser.as_mut(),
+            "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"bash\">\n<｜DSML｜ parameter name=\"command\" string=\"true\">echo ",
+            &mut out,
+        );
+        parser
+            .parse_decoded_into(DecodedInput::ControlToken("<think>"), &mut out)
+            .unwrap();
+        parser.parse_into("literal", &mut out).unwrap();
+        parser
+            .parse_decoded_into(DecodedInput::ControlToken("</think>"), &mut out)
+            .unwrap();
+        feed_dsml(
+            parser.as_mut(),
+            "</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+            &mut out,
+        );
         out.events.extend(parser.finish().unwrap().events);
         assert_eq!(
             assemble(&out.events),
@@ -1019,10 +1099,70 @@ mod token_boundary_tests {
     fn tool_header_cannot_claim_a_reasoning_control_token() {
         let mut parser = parser();
         let mut out = UnifiedParserOutput::default();
-        parser.reasoning_boundary(false, &mut out).unwrap();
         parser
-            .parse_into("<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"ba", &mut out)
+            .parse_decoded_into(DecodedInput::ControlToken("</think>"), &mut out)
             .unwrap();
-        assert!(parser.reasoning_boundary(false, &mut out).is_err());
+        feed_dsml(
+            parser.as_mut(),
+            "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"ba",
+            &mut out,
+        );
+        assert!(
+            parser
+                .parse_decoded_into(DecodedInput::ControlToken("</think>"), &mut out)
+                .is_err()
+        );
+    }
+    #[test]
+    fn ordinary_dsml_is_text_even_when_it_spells_a_complete_call() {
+        let mut parser = parser();
+        let mut out = UnifiedParserOutput::default();
+        parser
+            .parse_decoded_into(DecodedInput::ControlToken("</think>"), &mut out)
+            .unwrap();
+        let literal = "<｜DSML｜ calls><｜DSML｜ invoke name=\"bash\"><｜DSML｜ parameter name=\"command\" string=\"true\">echo OK</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>";
+        for ch in literal.chars() {
+            parser
+                .parse_decoded_into(DecodedInput::Text(&ch.to_string()), &mut out)
+                .unwrap();
+        }
+        out.events.extend(parser.finish().unwrap().events);
+        assert_eq!(
+            assemble(&out.events),
+            vec![UnifiedEvent::Text {
+                text: literal.into()
+            }]
+        );
+    }
+
+    #[test]
+    fn ordinary_closing_markup_inside_a_parameter_is_preserved() {
+        let mut parser = parser();
+        let mut out = UnifiedParserOutput::default();
+        parser
+            .parse_decoded_into(DecodedInput::ControlToken("</think>"), &mut out)
+            .unwrap();
+        feed_dsml(
+            parser.as_mut(),
+            "<｜DSML｜ calls><｜DSML｜ invoke name=\"bash\"><｜DSML｜ parameter name=\"command\" string=\"true\">",
+            &mut out,
+        );
+        let literal = "echo </｜DSML｜ parameter> and </｜DSML｜ invoke>";
+        parser
+            .parse_decoded_into(DecodedInput::Text(literal), &mut out)
+            .unwrap();
+        feed_dsml(
+            parser.as_mut(),
+            "</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>",
+            &mut out,
+        );
+        out.events.extend(parser.finish().unwrap().events);
+        assert_eq!(
+            assemble(&out.events),
+            vec![UnifiedEvent::ToolCall {
+                name: "bash".into(),
+                arguments: serde_json::json!({"command":literal})
+            }]
+        );
     }
 }

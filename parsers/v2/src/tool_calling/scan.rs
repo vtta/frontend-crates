@@ -45,6 +45,8 @@
 //! It is scoped OUTSIDE tool blocks only: once a block or bare invoke is open,
 //! a reasoning marker inside it is argument data, not a control token (`I7`).
 
+use super::input::{InputBuffer, InputText};
+use crate::unified::DecodedInput;
 use std::collections::HashSet;
 
 use crate::tool_calling::traits::{ToolCallDelta, ToolParseResult};
@@ -1359,6 +1361,15 @@ pub(crate) trait InvokeBoundary: Send {
         flush: bool,
         tool_index: usize,
     ) -> Option<usize>;
+    fn end_input(
+        &mut self,
+        input: InputText<'_>,
+        append: &str,
+        flush: bool,
+        tool_index: usize,
+    ) -> Option<usize> {
+        self.end_append(&input, append, flush, tool_index)
+    }
     fn opens(&self, text: &str, at: usize) -> bool;
     fn accepts_buffer_start(&self, _previous: Option<char>) -> bool {
         true
@@ -1475,8 +1486,6 @@ pub(crate) struct ReasoningSpec {
     /// pre-filled it (policy P5). Qwen3 is not one of these; DeepSeek-R1-style
     /// forced-reasoning templates are.
     pub forced_start: bool,
-    /// Reasoning transitions arrive as verified token events, not text matches.
-    pub external_boundaries: bool,
     /// Whether the reasoning markers require special-token preservation.
     pub preserve_special_tokens: bool,
     /// Role label the tokenizer writes immediately after `start`, e.g. gemma4's
@@ -1536,6 +1545,14 @@ pub(crate) trait InvokeEmitter {
     /// [`crate::unified::UnifiedParser::tool_call_id`] one layer down, so a
     /// family overrides it in exactly one place regardless of whether it is
     /// reached through the tool-only or unified adapter.
+    fn parse_input(
+        &mut self,
+        invoke: InputText<'_>,
+        tool_index: usize,
+    ) -> anyhow::Result<Option<Vec<ToolCallDelta>>> {
+        self.parse_invoke_deltas(&invoke, tool_index)
+    }
+
     fn tool_call_id(&self, _tool_index: usize) -> Option<&str> {
         None
     }
@@ -2008,7 +2025,7 @@ pub(crate) struct WrappedBlockScanner<E: InvokeEmitter> {
     reasoning_enabled: bool,
     /// Effective request-scoped start, separate from the family declaration.
     reasoning_forced_start: bool,
-    buffer: String,
+    buffer: InputBuffer,
     buffer_previous: Option<char>,
     prose: ProseControlState,
     tool_separator: Option<ToolSeparator>,
@@ -2059,7 +2076,7 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
             reasoning: None,
             reasoning_enabled: false,
             reasoning_forced_start: false,
-            buffer: String::new(),
+            buffer: InputBuffer::default(),
             buffer_previous: None,
             prose: ProseControlState::default(),
             tool_separator: None,
@@ -2279,6 +2296,41 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
         Ok(out)
     }
 
+    pub(crate) fn with_token_input(mut self) -> Self {
+        self.buffer = InputBuffer::tokens();
+        self
+    }
+
+    pub(crate) fn push_decoded_into<S: EventSink + ?Sized>(
+        &mut self,
+        input: DecodedInput<'_>,
+        out: &mut S,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.buffer.is_token_input(),
+            "decoded pieces require a token-input parser"
+        );
+        match input {
+            DecodedInput::Text(text) => self.buffer.push_str(text),
+            DecodedInput::ControlToken(text) => {
+                if self.in_block
+                    && self
+                        .reasoning
+                        .is_some_and(|r| text == r.start || text == r.end)
+                {
+                    anyhow::ensure!(
+                        self.invoke_boundary
+                            .as_ref()
+                            .is_some_and(|b| b.owns_reasoning_boundary()),
+                        "reasoning control token interrupted a tool header"
+                    );
+                }
+                self.buffer.push_control(text)?;
+            }
+        }
+        self.drain(false, out)
+    }
+
     /// Drain one advance directly into the caller's sink.
     ///
     /// Preferred over [`Self::push_ordered`] on any fallible path: events reach the
@@ -2308,7 +2360,7 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
     pub(crate) fn reset(&mut self) -> String {
         self.finish_at_eos = false;
         let mut pending = std::mem::take(&mut self.uncommitted_block);
-        pending.push_str(&std::mem::take(&mut self.buffer));
+        pending.push_str(&self.buffer.take_text());
         self.buffer_previous = None;
         self.in_block = false;
         self.prose.clear();
@@ -2359,10 +2411,10 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
 
     fn parse_complete_invoke(
         &mut self,
-        invoke: &str,
+        invoke: InputText<'_>,
         tool_index: usize,
     ) -> anyhow::Result<Option<Vec<ToolCallDelta>>> {
-        match self.emitter.parse_invoke_deltas(invoke, tool_index) {
+        match self.emitter.parse_input(invoke, tool_index) {
             Ok(Some(deltas)) if !deltas.is_empty() => {
                 if let Some(deferred) = self.pending_parse_error.take() {
                     tracing::warn!(
@@ -2374,7 +2426,7 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
                 }
                 Ok(Some(deltas))
             }
-            Err(error) if self.emitter.defer_parse_error(invoke, &error) => {
+            Err(error) if self.emitter.defer_parse_error(&invoke, &error) => {
                 let deferred = self
                     .pending_parse_error
                     .get_or_insert_with(|| DeferredParseError {
@@ -2403,7 +2455,7 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
     }
 
     /// Find the next real invoke opener, applying the family hook when present.
-    fn find_invoke_start(&self, text: &str) -> Option<usize> {
+    fn find_invoke_start(&self, text: InputText<'_>) -> Option<usize> {
         if self.block_is_invoke() && self.in_block {
             return Some(0);
         }
@@ -2413,18 +2465,19 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
                 .as_ref()
                 .expect("block-is-invoke requires a family boundary");
             return boundary
-                .bare_invoke_start(text)
+                .bare_invoke_start(&text)
                 .filter(|&start| boundary.accepts_bare_invoke(&text[start..]));
         }
         let invoke_start = &self.spec.invoke_start;
         let Some(boundary) = self.invoke_boundary.as_ref() else {
-            return text.find(invoke_start.as_str());
+            return text.find_marker(invoke_start.as_str());
         };
         let mut cursor = 0;
         while let Some(relative) = text[cursor..].find(invoke_start.as_str()) {
             let at = cursor + relative;
             if (at > 0 || boundary.accepts_buffer_start(self.buffer_previous))
-                && boundary.opens(text, at)
+                && text.is_marker(at, invoke_start)
+                && boundary.opens(&text, at)
             {
                 return Some(at);
             }
@@ -2437,7 +2490,7 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
         if self.block_is_invoke() {
             Some(0)
         } else {
-            self.find_invoke_start(&self.buffer)
+            self.find_invoke_start(self.buffer.view())
         }
     }
 
@@ -2447,7 +2500,7 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
             Some(boundary) => {
                 let append = &self.buffer[self.invoke_boundary_len..];
                 self.invoke_boundary_len = self.buffer.len();
-                boundary.end_append(&self.buffer, append, flush, self.next_index)
+                boundary.end_input(self.buffer.view(), append, flush, self.next_index)
             }
             None => self
                 .buffer
@@ -2479,24 +2532,25 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
 
     /// Position and length of the reasoning opener in the buffer, if configured.
     fn find_reasoning_start(&self, flush: bool) -> Option<(usize, usize)> {
-        if !self.reasoning_enabled || self.reasoning.is_some_and(|r| r.external_boundaries) {
+        if !self.reasoning_enabled {
             return None;
         }
         let reasoning = self.reasoning.as_ref()?;
-        let pos = self.buffer.find(reasoning.start)?;
+        let pos = self.buffer.view().find_marker(reasoning.start)?;
         Some((pos, self.opener_len_at(pos, flush)?))
     }
 
     /// Position and length of the earliest malformed close outside a block.
     fn find_orphan_marker(&self) -> Option<(usize, usize)> {
-        let regular = find_first(&self.buffer, &self.spec.orphan_markers);
+        let regular = self.buffer.view().find_first(&self.spec.orphan_markers);
         let reasoning_close = self
             .reasoning
             .as_ref()
-            .filter(|r| self.reasoning_enabled && !r.external_boundaries)
+            .filter(|_| self.reasoning_enabled)
             .and_then(|reasoning| {
                 self.buffer
-                    .find(reasoning.end)
+                    .view()
+                    .find_marker(reasoning.end)
                     .map(|pos| (pos, reasoning.end.len()))
             });
         regular
@@ -2514,7 +2568,7 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
         let reasoning = self
             .reasoning
             .as_ref()
-            .filter(|r| self.reasoning_enabled && !r.external_boundaries)
+            .filter(|_| self.reasoning_enabled)
             .map(|reasoning| {
                 marker_prefix_suffix_len(&self.buffer, [reasoning.start, reasoning.end])
             })
@@ -2570,7 +2624,7 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
         }
         let tail = &self.buffer[at..];
         if self.spec.block_starts.iter().any(|m| tail.starts_with(m))
-            || self.find_invoke_start(tail) == Some(0)
+            || self.find_invoke_start(self.buffer.view().suffix(at)) == Some(0)
         {
             framing.separator.len()
         } else {
@@ -2581,11 +2635,7 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
     /// Retain a complete reasoning opener while its optional role label is only
     /// partially buffered.
     fn pending_label_len(&self) -> usize {
-        let Some(reasoning) = self
-            .reasoning
-            .as_ref()
-            .filter(|r| self.reasoning_enabled && !r.external_boundaries)
-        else {
+        let Some(reasoning) = self.reasoning.as_ref().filter(|_| self.reasoning_enabled) else {
             return 0;
         };
         let Some(label) = reasoning.start_label else {
@@ -2600,41 +2650,6 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
         } else {
             0
         }
-    }
-
-    pub(crate) fn reasoning_boundary<S: EventSink + ?Sized>(
-        &mut self,
-        opening: bool,
-        out: &mut S,
-    ) -> anyhow::Result<()> {
-        let spec = self
-            .reasoning
-            .ok_or_else(|| anyhow::anyhow!("reasoning boundary without grammar"))?;
-        anyhow::ensure!(
-            spec.external_boundaries,
-            "token reasoning boundaries are not enabled"
-        );
-        let marker = if opening { spec.start } else { spec.end };
-        if self.in_block {
-            anyhow::ensure!(
-                self.invoke_boundary
-                    .as_ref()
-                    .is_some_and(|b| b.owns_reasoning_boundary()),
-                "reasoning control token interrupted a tool header"
-            );
-            self.buffer.push_str(marker);
-            return self.drain(false, out);
-        }
-        if !self.reasoning_enabled {
-            self.buffer.push_str(marker);
-            return self.drain(false, out);
-        }
-        // Flush the preceding channel, including an unfinished prose quote.
-        self.drain(true, out)?;
-        self.in_reasoning = opening;
-        self.resume_reasoning = false;
-        self.prose.clear();
-        Ok(())
     }
 
     /// Consume buffered reasoning up to its closer, or as far as is safe.
@@ -2667,29 +2682,35 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
         //    same rule the orphan handler applies outside reasoning, so being inside
         //    a thought cannot turn markup into content (`I3`). The closer is excluded
         //    from this set because it legitimately ends the span.
-        let tool_open = find_first(&self.buffer, &self.spec.block_starts)
+        let tool_open = self
+            .buffer
+            .view()
+            .find_first(&self.spec.block_starts)
             .map(|(pos, _)| pos)
             .into_iter()
-            .chain(self.find_invoke_start(&self.buffer))
+            .chain(self.find_invoke_start(self.buffer.view()))
             .min();
-        let duplicate_start = if reasoning.external_boundaries {
-            None
-        } else {
-            self.buffer
-                .find(start)
-                .and_then(|pos| Some((pos, self.opener_len_at(pos, flush)?)))
-        };
-        let close = if reasoning.external_boundaries {
-            None
-        } else {
-            self.buffer.find(end)
-        };
-        let stray = stray_in_reasoning(
-            &self.buffer,
-            duplicate_start,
-            end,
-            &self.spec.orphan_markers,
-        );
+        let duplicate_start = self
+            .buffer
+            .view()
+            .find_marker(start)
+            .and_then(|pos| Some((pos, self.opener_len_at(pos, flush)?)));
+        let close = self.buffer.view().find_marker(end);
+        let stray = duplicate_start
+            .into_iter()
+            .chain(
+                self.spec
+                    .orphan_markers
+                    .iter()
+                    .filter(|marker| marker.as_str() != end)
+                    .filter_map(|marker| {
+                        self.buffer
+                            .view()
+                            .find_marker(marker)
+                            .map(|at| (at, marker.len()))
+                    }),
+            )
+            .min_by_key(|&(at, _)| at);
 
         if let Some((at, what)) = earliest([
             close.map(|pos| (pos, InReasoning::Close)),
@@ -3304,7 +3325,7 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
             return self.drain_envelope(env, flush, out);
         }
         loop {
-            if !self.in_block {
+            if !self.in_block && !self.buffer.is_token_input() {
                 let control = self.prose.classify(
                     &self.buffer,
                     self.spec
@@ -3375,7 +3396,7 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
                 // Close the block once no more complete invokes precede its end.
                 if !self.block_is_invoke()
                     && let Some((end_pos, end_len)) =
-                        find_first(&self.buffer, &self.spec.block_ends)
+                        self.buffer.view().find_first(&self.spec.block_ends)
                 {
                     let invoke_before_end = invoke_start.is_some_and(|start| start < end_pos);
                     if !invoke_before_end {
@@ -3519,12 +3540,12 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
                     self.suppress_normal_text = false;
                     continue;
                 }
-                let invoke = self.buffer[..end].to_string();
+                let invoke = self.buffer.prefix_owned(end);
                 // Emit BEFORE consuming. `parse_invoke` is fallible, and draining first
                 // meant a failing emitter destroyed the invoke bytes: they were gone from
                 // the buffer, so `reset` could no longer hand them back and the
                 // documented recovery contract was false for the only shipped family.
-                let emitted = self.parse_complete_invoke(&invoke, self.next_index)?;
+                let emitted = self.parse_complete_invoke(invoke.view(), self.next_index)?;
                 self.consume_buffer_prefix(end);
                 self.reset_invoke_boundary();
                 if let Some(deltas) = emitted {
@@ -3560,10 +3581,13 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
             // the natural text preceding it. Clear the latch either way (the
             // markup context has ended).
             if let Some((pos, len)) = self.find_orphan_marker() {
-                let next_open = find_first(&self.buffer, &self.spec.block_starts)
+                let next_open = self
+                    .buffer
+                    .view()
+                    .find_first(&self.spec.block_starts)
                     .map(|(p, _)| p)
                     .into_iter()
-                    .chain(self.find_invoke_start(&self.buffer))
+                    .chain(self.find_invoke_start(self.buffer.view()))
                     // A reasoning opener counts as an opener here, so the
                     // matching closer in `<think>a</think>` is not mistaken for
                     // an orphan and stripped.
@@ -3585,9 +3609,11 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
             // Block wins a tie with a bare invoke, preserving the pre-unified
             // tie-break.
             let next_marker = earliest([
-                find_first(&self.buffer, &self.spec.block_starts)
+                self.buffer
+                    .view()
+                    .find_first(&self.spec.block_starts)
                     .map(|(pos, len)| (pos, Marker::Block(len))),
-                self.find_invoke_start(&self.buffer)
+                self.find_invoke_start(self.buffer.view())
                     .map(|pos| (pos, Marker::BareInvoke)),
                 self.find_reasoning_start(flush)
                     .map(|(pos, len)| (pos, Marker::ReasoningStart(len))),
@@ -3670,9 +3696,9 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
                         }
                         break;
                     };
-                    let invoke = self.buffer[..end].to_string();
+                    let invoke = self.buffer.prefix_owned(end);
                     // Emit before consuming — same recovery contract as the wrapped site.
-                    let emitted = self.parse_complete_invoke(&invoke, self.next_index)?;
+                    let emitted = self.parse_complete_invoke(invoke.view(), self.next_index)?;
                     self.consume_buffer_prefix(end);
                     self.clear_uncommitted_block();
                     self.reset_invoke_boundary();
@@ -3996,7 +4022,6 @@ mod tests {
     #[test]
     fn request_reasoning_start_does_not_overwrite_the_family_default() {
         let mut scanner = failing_scanner().with_reasoning(ReasoningSpec {
-            external_boundaries: false,
             start: "<think>",
             end: "</think>",
             forced_start: true,
