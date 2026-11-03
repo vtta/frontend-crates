@@ -171,6 +171,7 @@ pub(crate) fn gemma4_unified(tools: &[Tool]) -> Box<dyn UnifiedParser> {
     // calls would vanish on the unified path only.
     Box::new(GuidedRouted::new(
         ScannerUnified::new(gemma4_scanner(tools).with_reasoning(ReasoningSpec {
+            external_boundaries: false,
             start: REASONING_START,
             end: REASONING_END,
             start_label: Some(REASONING_START_LABEL),

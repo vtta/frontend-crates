@@ -23,6 +23,16 @@ pub(crate) const PARAMETER_START: &str = "<｜DSML｜ parameter name=\"";
 pub(crate) const PARAMETER_END: &str = "</｜DSML｜ parameter>";
 
 pub(crate) fn deepseek_v41_unified(_tools: &[Tool]) -> Box<dyn UnifiedParser> {
+    build(false)
+}
+
+/// Native token path: only verified control-token events change reasoning channels.
+/// Ordinary text spellings remain data, including inside tool arguments.
+pub fn token_unified(_tools: &[Tool]) -> Box<dyn UnifiedParser> {
+    build(true)
+}
+
+fn build(external_boundaries: bool) -> Box<dyn UnifiedParser> {
     let spec = WrappedBlockSpec {
         family: "deepseek_v41",
         block_starts: vec![BLOCK_START.into()],
@@ -41,6 +51,7 @@ pub(crate) fn deepseek_v41_unified(_tools: &[Tool]) -> Box<dyn UnifiedParser> {
         .with_reasoning(ReasoningSpec {
             start: "<think>",
             end: "</think>",
+            external_boundaries,
             preserve_special_tokens: true,
             ..Default::default()
         });
@@ -130,6 +141,13 @@ impl DeepSeekV41InvocationBoundary {
 }
 
 impl InvokeBoundary for DeepSeekV41InvocationBoundary {
+    fn owns_reasoning_boundary(&self) -> bool {
+        matches!(
+            self.position,
+            InvocationPosition::ParameterValue { .. } | InvocationPosition::JsonValue
+        )
+    }
+
     fn owns_guided_prefix(&self) -> bool {
         true
     }
@@ -893,5 +911,118 @@ mod tests {
         parser.finish().unwrap();
         assert!(parser.reset().is_empty());
         assert_eq!(parser.push(input).unwrap(), first);
+    }
+}
+
+#[cfg(test)]
+mod token_boundary_tests {
+    use super::*;
+    use crate::{
+        UnifiedEvent, UnifiedParserInit, UnifiedParserOutput, UnifiedParserStartingState, assemble,
+    };
+
+    fn parser() -> Box<dyn UnifiedParser> {
+        let mut parser = token_unified(&[]);
+        parser
+            .initialize_request(UnifiedParserInit {
+                starting_state: UnifiedParserStartingState::Reasoning,
+                ..Default::default()
+            })
+            .unwrap();
+        parser
+    }
+
+    #[test]
+    fn reserved_boundaries_ignore_prose_quotes_but_ordinary_spellings_stay_literal() {
+        for (before, after) in [
+            ("R `x", "A `y`"),
+            ("R \"x", "A \"y\""),
+            ("```js\n/`/\n```\n", "A `y`"),
+            (
+                "Literal </think> and <think> remain reasoning. 中文😀",
+                "Answer.",
+            ),
+        ] {
+            for fragmented in [false, true] {
+                let mut parser = parser();
+                let mut out = UnifiedParserOutput::default();
+                let chunks = |s: &str| {
+                    if fragmented {
+                        s.chars().map(|c| c.to_string()).collect::<Vec<_>>()
+                    } else {
+                        vec![s.to_owned()]
+                    }
+                };
+                for text in chunks(before) {
+                    parser.parse_into(&text, &mut out).unwrap();
+                }
+                parser.reasoning_boundary(false, &mut out).unwrap();
+                for text in chunks(after) {
+                    parser.parse_into(&text, &mut out).unwrap();
+                }
+                out.events.extend(parser.finish().unwrap().events);
+                assert_eq!(
+                    assemble(&out.events),
+                    vec![
+                        UnifiedEvent::Reasoning {
+                            text: before.into()
+                        },
+                        UnifiedEvent::Text { text: after.into() }
+                    ]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_close_is_idempotent() {
+        let mut parser = parser();
+        let mut out = UnifiedParserOutput::default();
+        parser.reasoning_boundary(false, &mut out).unwrap();
+        parser.parse_into("A", &mut out).unwrap();
+        parser.reasoning_boundary(false, &mut out).unwrap();
+        parser.parse_into("B", &mut out).unwrap();
+        out.events.extend(parser.finish().unwrap().events);
+        assert_eq!(
+            assemble(&out.events),
+            vec![UnifiedEvent::Text { text: "AB".into() }]
+        );
+        assert!(parser.reasoning_boundary(false, &mut out).is_err());
+    }
+
+    #[test]
+    fn tool_argument_payload_owns_marker_spellings() {
+        let mut parser = parser();
+        let mut out = UnifiedParserOutput::default();
+        parser.reasoning_boundary(false, &mut out).unwrap();
+        parser.parse_into("<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"bash\">\n<｜DSML｜ parameter name=\"command\" string=\"true\">echo ", &mut out).unwrap();
+        parser.reasoning_boundary(true, &mut out).unwrap();
+        parser.parse_into("literal", &mut out).unwrap();
+        parser.reasoning_boundary(false, &mut out).unwrap();
+        parser
+            .parse_into(
+                "</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+                &mut out,
+            )
+            .unwrap();
+        out.events.extend(parser.finish().unwrap().events);
+        assert_eq!(
+            assemble(&out.events),
+            vec![UnifiedEvent::ToolCall {
+                name: "bash".into(),
+                arguments: serde_json::json!({"command":"echo <think>literal</think>"}),
+            }]
+        );
+    }
+
+    #[test]
+    fn tool_header_cannot_claim_a_reasoning_control_token() {
+        let mut parser = parser();
+        let mut out = UnifiedParserOutput::default();
+        parser.reasoning_boundary(false, &mut out).unwrap();
+        parser
+            .parse_into("<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"ba", &mut out)
+            .unwrap();
+        assert!(parser.reasoning_boundary(false, &mut out).is_err());
     }
 }

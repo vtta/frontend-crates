@@ -1288,6 +1288,11 @@ impl InvokeBoundaryFactory {
 /// Family-owned request-local invoke-boundary contract.
 ///
 pub(crate) trait InvokeBoundary: Send {
+    /// A control-token spelling is argument data only while a payload owns it.
+    fn owns_reasoning_boundary(&self) -> bool {
+        false
+    }
+
     /// Restore request/channel context after a retained candidate is rebased.
     fn set_guided_context(&mut self, _context: GuidedInvokePrefixContext) {}
 
@@ -1470,6 +1475,8 @@ pub(crate) struct ReasoningSpec {
     /// pre-filled it (policy P5). Qwen3 is not one of these; DeepSeek-R1-style
     /// forced-reasoning templates are.
     pub forced_start: bool,
+    /// Reasoning transitions arrive as verified token events, not text matches.
+    pub external_boundaries: bool,
     /// Whether the reasoning markers require special-token preservation.
     pub preserve_special_tokens: bool,
     /// Role label the tokenizer writes immediately after `start`, e.g. gemma4's
@@ -2472,7 +2479,7 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
 
     /// Position and length of the reasoning opener in the buffer, if configured.
     fn find_reasoning_start(&self, flush: bool) -> Option<(usize, usize)> {
-        if !self.reasoning_enabled {
+        if !self.reasoning_enabled || self.reasoning.is_some_and(|r| r.external_boundaries) {
             return None;
         }
         let reasoning = self.reasoning.as_ref()?;
@@ -2486,7 +2493,7 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
         let reasoning_close = self
             .reasoning
             .as_ref()
-            .filter(|_| self.reasoning_enabled)
+            .filter(|r| self.reasoning_enabled && !r.external_boundaries)
             .and_then(|reasoning| {
                 self.buffer
                     .find(reasoning.end)
@@ -2507,7 +2514,7 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
         let reasoning = self
             .reasoning
             .as_ref()
-            .filter(|_| self.reasoning_enabled)
+            .filter(|r| self.reasoning_enabled && !r.external_boundaries)
             .map(|reasoning| {
                 marker_prefix_suffix_len(&self.buffer, [reasoning.start, reasoning.end])
             })
@@ -2574,7 +2581,11 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
     /// Retain a complete reasoning opener while its optional role label is only
     /// partially buffered.
     fn pending_label_len(&self) -> usize {
-        let Some(reasoning) = self.reasoning.as_ref().filter(|_| self.reasoning_enabled) else {
+        let Some(reasoning) = self
+            .reasoning
+            .as_ref()
+            .filter(|r| self.reasoning_enabled && !r.external_boundaries)
+        else {
             return 0;
         };
         let Some(label) = reasoning.start_label else {
@@ -2589,6 +2600,41 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
         } else {
             0
         }
+    }
+
+    pub(crate) fn reasoning_boundary<S: EventSink + ?Sized>(
+        &mut self,
+        opening: bool,
+        out: &mut S,
+    ) -> anyhow::Result<()> {
+        let spec = self
+            .reasoning
+            .ok_or_else(|| anyhow::anyhow!("reasoning boundary without grammar"))?;
+        anyhow::ensure!(
+            spec.external_boundaries,
+            "token reasoning boundaries are not enabled"
+        );
+        let marker = if opening { spec.start } else { spec.end };
+        if self.in_block {
+            anyhow::ensure!(
+                self.invoke_boundary
+                    .as_ref()
+                    .is_some_and(|b| b.owns_reasoning_boundary()),
+                "reasoning control token interrupted a tool header"
+            );
+            self.buffer.push_str(marker);
+            return self.drain(false, out);
+        }
+        if !self.reasoning_enabled {
+            self.buffer.push_str(marker);
+            return self.drain(false, out);
+        }
+        // Flush the preceding channel, including an unfinished prose quote.
+        self.drain(true, out)?;
+        self.in_reasoning = opening;
+        self.resume_reasoning = false;
+        self.prose.clear();
+        Ok(())
     }
 
     /// Consume buffered reasoning up to its closer, or as far as is safe.
@@ -2626,10 +2672,18 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
             .into_iter()
             .chain(self.find_invoke_start(&self.buffer))
             .min();
-        let duplicate_start = self
-            .buffer
-            .find(start)
-            .and_then(|pos| Some((pos, self.opener_len_at(pos, flush)?)));
+        let duplicate_start = if reasoning.external_boundaries {
+            None
+        } else {
+            self.buffer
+                .find(start)
+                .and_then(|pos| Some((pos, self.opener_len_at(pos, flush)?)))
+        };
+        let close = if reasoning.external_boundaries {
+            None
+        } else {
+            self.buffer.find(end)
+        };
         let stray = stray_in_reasoning(
             &self.buffer,
             duplicate_start,
@@ -2638,7 +2692,7 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
         );
 
         if let Some((at, what)) = earliest([
-            self.buffer.find(end).map(|pos| (pos, InReasoning::Close)),
+            close.map(|pos| (pos, InReasoning::Close)),
             tool_open.map(|pos| (pos, InReasoning::ToolOpen)),
             stray.map(|(pos, len)| (pos, InReasoning::Stray(len))),
         ]) {
@@ -3942,6 +3996,7 @@ mod tests {
     #[test]
     fn request_reasoning_start_does_not_overwrite_the_family_default() {
         let mut scanner = failing_scanner().with_reasoning(ReasoningSpec {
+            external_boundaries: false,
             start: "<think>",
             end: "</think>",
             forced_start: true,

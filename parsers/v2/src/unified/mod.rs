@@ -389,6 +389,16 @@ pub trait UnifiedParser: Send {
     /// that may commit events and THEN fail must be driven through `parse_into`.
     fn parse_into(&mut self, delta: &str, output: &mut UnifiedParserOutput) -> Result<()>;
 
+    /// Apply a reasoning delimiter verified by the caller's original token ID.
+    /// Text-only parsers reject this; use the model's token-aware factory.
+    fn reasoning_boundary(
+        &mut self,
+        _opening: bool,
+        _output: &mut UnifiedParserOutput,
+    ) -> Result<()> {
+        anyhow::bail!("this unified parser does not support reasoning boundary events")
+    }
+
     /// Feed one token-id chunk. Parsers without token-native ingestion fail
     /// explicitly so a caller cannot mistake an ignored chunk for parsed output.
     fn parse_token_ids_into(
@@ -872,6 +882,14 @@ impl<E: InvokeEmitter> ScannerUnified<E> {
 }
 
 impl<E: InvokeEmitter + Send> NativeUnified for ScannerUnified<E> {
+    fn reasoning_boundary(
+        &mut self,
+        opening: bool,
+        output: &mut UnifiedParserOutput,
+    ) -> Result<()> {
+        self.scanner.reasoning_boundary(opening, output)
+    }
+
     fn preserve_special_tokens(&self) -> bool {
         self.scanner.preserve_special_tokens()
     }
@@ -968,6 +986,14 @@ pub(crate) enum GuidedPrefilledHeader {
 }
 
 pub(crate) trait NativeUnified {
+    fn reasoning_boundary(
+        &mut self,
+        _opening: bool,
+        _output: &mut UnifiedParserOutput,
+    ) -> Result<()> {
+        anyhow::bail!("this native parser does not support reasoning boundary events")
+    }
+
     /// Whether decoding must preserve tokenizer special tokens for this grammar.
     ///
     /// Answered by the family, NOT defaulted here. An adapter that inherited
@@ -1242,6 +1268,19 @@ impl<N: NativeUnified> GuidedRouted<N> {
 }
 
 impl<N: NativeUnified + Send> UnifiedParser for GuidedRouted<N> {
+    fn reasoning_boundary(
+        &mut self,
+        opening: bool,
+        output: &mut UnifiedParserOutput,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !self.finished && self.guided.is_none(),
+            "reasoning boundary requires an active native parser"
+        );
+        self.started = true;
+        self.native.reasoning_boundary(opening, output)
+    }
+
     fn input_capabilities(&self) -> UnifiedParserInputCapabilities {
         self.native.input_capabilities()
     }
@@ -6652,6 +6691,14 @@ impl DebugUnifiedParser {
 }
 
 impl UnifiedParser for DebugUnifiedParser {
+    fn reasoning_boundary(
+        &mut self,
+        opening: bool,
+        output: &mut UnifiedParserOutput,
+    ) -> Result<()> {
+        self.inner.reasoning_boundary(opening, output)
+    }
+
     fn input_capabilities(&self) -> UnifiedParserInputCapabilities {
         self.inner.input_capabilities()
     }
@@ -8072,6 +8119,7 @@ mod tests {
     #[test]
     fn guided_payload_boundary_accepts_multibyte_trailing_text() {
         let reasoning = GuidedReasoning::Pair(ReasoningSpec {
+            external_boundaries: false,
             start: "<think>",
             end: "</think>",
             forced_start: false,
@@ -8109,6 +8157,7 @@ mod tests {
     fn guided_reset_restores_all_request_scoped_flags() {
         let mut guided = GuidedState::new(
             GuidedReasoning::Pair(ReasoningSpec {
+                external_boundaries: false,
                 start: "<think>",
                 end: "</think>",
                 forced_start: false,
