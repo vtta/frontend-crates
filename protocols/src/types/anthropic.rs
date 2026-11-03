@@ -184,6 +184,8 @@ pub struct AnthropicCreateMessageRequest {
 
     /// Output configuration: effort level and optional JSON schema format.
     /// `effort` can be `"low"`, `"medium"`, `"high"`, or `"max"`.
+    /// Native DeepSeek V4.1 adapters may also accept integer efforts 1–100.
+    /// Model-specific named efforts remain subject to the selected formatter's validation.
     /// `format` specifies structured JSON output constraints.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_config: Option<serde_json::Value>,
